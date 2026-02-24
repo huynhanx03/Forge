@@ -1,8 +1,9 @@
-use bytes::{Buf, BufMut, BytesMut};
-use uuid::Uuid;
+use bytes::{Buf, BufMut};
 
 pub trait Type {
-    fn decode<B: Buf>(buf: &mut B) -> Result<Self, String>;
+    fn decode<B: Buf>(buf: &mut B) -> Result<Self, String>
+    where
+        Self: Sized;
     fn encode<B: BufMut>(&self, buf: &mut B);
 }
 
@@ -40,6 +41,10 @@ impl_primitive!(i8, 1, get_i8, put_i8);
 impl_primitive!(i16, 2, get_i16, put_i16);
 impl_primitive!(i32, 4, get_i32, put_i32);
 impl_primitive!(i64, 8, get_i64, put_i64);
+impl_primitive!(u8, 1, get_u8, put_u8);
+impl_primitive!(u16, 2, get_u16, put_u16);
+impl_primitive!(u32, 4, get_u32, put_u32);
+impl_primitive!(u64, 8, get_u64, put_u64);
 
 macro_rules! impl_unsigned_varint_trait {
     ($name:ident, $inner:ty, $max_bytes:expr) => {
@@ -156,8 +161,9 @@ impl Type for String {
         if buf.remaining() < len {
             return Err("Not enough data for String".to_string());
         }
-        let bytes = buf.split_to(len);
-        String::from_utf8(bytes.to_vec()).map_err(|e| e.to_string())
+        let mut bytes = vec![0u8; len];
+        buf.copy_to_slice(&mut bytes);
+        String::from_utf8(bytes).map_err(|e| e.to_string())
     }
 
     fn encode<B: BufMut>(&self, buf: &mut B) {
@@ -182,10 +188,9 @@ impl Type for CompactString {
             return Err("Not enough data for CompactString".to_string());
         }
 
-        let bytes = buf.split_to(len);
-        String::from_utf8(bytes.to_vec())
-            .map_err(|e| e.to_string())
-            .map(CompactString)
+        let mut bytes = vec![0u8; len];
+        buf.copy_to_slice(&mut bytes);
+        String::from_utf8(bytes).map_err(|e| e.to_string()).map(CompactString)
     }
 
     fn encode<B: BufMut>(&self, buf: &mut B) {

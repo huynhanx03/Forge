@@ -1,12 +1,12 @@
-use bytes::Buf;
 use crate::protocol::types::Type;
+use bytes::Buf;
 
 #[derive(Debug)]
 pub struct RequestHeader {
     pub api_key: i16,
     pub api_version: i16,
     pub correlation_id: i32,
-    pub client_id: String,
+    pub client_id: Option<String>,
 }
 
 impl RequestHeader {
@@ -15,22 +15,23 @@ impl RequestHeader {
         let api_version = i16::decode(buf)?;
         let correlation_id = i32::decode(buf)?;
         let client_id = if buf.remaining() >= 2 {
-            let mut temp_buf = buf.check();
+            let chunk = buf.chunk();
+            if chunk.len() >= 2 {
+                let len = i16::from_be_bytes([chunk[0], chunk[1]]);
 
-            if temp_buf.len() >= 2 {
-                let len = i16::from_be_bytes(temp_buf[0], temp_buf[1]);
-                
                 if len < 0 {
                     buf.advance(2);
                     None
                 } else {
                     String::decode(buf).ok()
                 }
+            } else {
+                String::decode(buf).ok()
             }
         } else {
             None
         };
-        
+
         Ok(Self {
             api_key,
             api_version,

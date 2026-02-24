@@ -1,5 +1,9 @@
+use crate::protocol::request::RequestHeader;
+use crate::protocol::response::ResponseHeader;
+use bytes::{BufMut, BytesMut};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
+use tokio_util::sync::CancellationToken;
 
 pub struct TcpServer;
 
@@ -8,10 +12,10 @@ const API_VERSIONS_KEY: i16 = 18;
 const UNSUPPORTED_VERSION_ERROR: i16 = 35;
 
 impl TcpServer {
-    pub async fn listen(address: &str) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn listen(address: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let listener = TcpListener::bind(address).await?;
         tracing::info!("Server started on {}", address);
-        
+
         let cancel_token = CancellationToken::new();
         let cancel_token_clone = cancel_token.clone();
 
@@ -38,9 +42,10 @@ impl TcpServer {
                     }
                 }
 
-                _ = cancel_token.cancelled();
-                tracing::info!("Server shutting down...");
-                break;
+                _ = cancel_token.cancelled() => {
+                    tracing::info!("Server shutting down...");
+                    break;
+                }
             }
         }
 
@@ -48,7 +53,10 @@ impl TcpServer {
         Ok(())
     }
 
-    async fn handle_connection(socket: &mut tokio::net::TcpStream, cancel_token: CancellationToken) {
+    async fn handle_connection(
+        socket: &mut tokio::net::TcpStream,
+        cancel_token: CancellationToken,
+    ) {
         loop {
             tokio::select! {
                 read_result = Self::read_frame(socket) => {
@@ -85,7 +93,7 @@ impl TcpServer {
                                     let mut final_packet = BytesMut::new();
                                     final_packet.put_i32(response_body.len() as i32);
                                     final_packet.put_slice(&response_body);
-                                    
+
                                     if let Err(e) = socket.write_all(&final_packet).await {
                                         tracing::error!("Failed to write response: {}", e);
                                         break;
@@ -108,14 +116,17 @@ impl TcpServer {
                     }
                 }
 
-                _ = cancel_token.cancelled();
-                tracing::info!("Connection shut down gracefully");
-                break;
+                _ = cancel_token.cancelled() => {
+                    tracing::info!("Connection shut down gracefully");
+                    break;
+                }
             }
         }
     }
 
-    async fn read_frame(socket: &mut tokio::net::TcpStream) -> Result<Option<Vec<u8>>, Box<dyn std::error::Error>> {
+    async fn read_frame(
+        socket: &mut tokio::net::TcpStream,
+    ) -> Result<Option<Vec<u8>>, Box<dyn std::error::Error + Send + Sync>> {
         let mut size_buf = [0u8; 4];
         if socket.read_exact(&mut size_buf).await.is_err() {
             return Ok(None);
@@ -123,7 +134,11 @@ impl TcpServer {
 
         let size = u32::from_be_bytes(size_buf);
         if size > MAX_MESSAGE_SIZE {
-            tracing::warn!("Request size {} exceeds max allowed size {}", size, MAX_MESSAGE_SIZE);
+            tracing::warn!(
+                "Request size {} exceeds max allowed size {}",
+                size,
+                MAX_MESSAGE_SIZE
+            );
             return Err("Request size exceeds max allowed size".into());
         }
 
