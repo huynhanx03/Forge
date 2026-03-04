@@ -190,7 +190,9 @@ impl Type for CompactString {
 
         let mut bytes = vec![0u8; len];
         buf.copy_to_slice(&mut bytes);
-        String::from_utf8(bytes).map_err(|e| e.to_string()).map(CompactString)
+        String::from_utf8(bytes)
+            .map_err(|e| e.to_string())
+            .map(CompactString)
     }
 
     fn encode<B: BufMut>(&self, buf: &mut B) {

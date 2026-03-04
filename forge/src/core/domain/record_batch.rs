@@ -29,8 +29,8 @@ const HEADER_SIZE: usize = PARTITION_LEADER_EPOCH_SIZE + MAGIC_SIZE + CRC_SIZE;
 pub const BATCH_HEADER_SIZE: usize = 8 + 4;
 pub const BATCH_LENGTH_OFFSET: usize = 8;
 
-impl RecordBatch {
-    pub fn decode<B: Buf>(buf: &mut B) -> Result<Self, String> {
+impl Type for RecordBatch {
+    fn decode<B: Buf>(buf: &mut B) -> Result<Self, String> {
         let base_offset = i64::decode(buf)?;
         let batch_length = i32::decode(buf)?;
         let partition_leader_epoch = i32::decode(buf)?;
@@ -82,7 +82,7 @@ impl RecordBatch {
         })
     }
 
-    pub fn encode<B: BufMut>(&self, buf: &mut B) {
+    fn encode<B: BufMut>(&self, buf: &mut B) {
         let mut temp_buf = Vec::new();
 
         self.attributes.encode(&mut temp_buf);
