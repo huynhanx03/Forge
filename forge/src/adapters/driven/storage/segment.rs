@@ -1,7 +1,8 @@
 use crate::{
     core::domain::record_batch::{BATCH_HEADER_SIZE, BATCH_LENGTH_OFFSET, RecordBatch},
     protocol::types::Type,
-    shared::fs::{open_append_file, write_encoded_structure, delete_file},
+    shared::constants::{INDEX_EXTENSION, LOG_EXTENSION, TIMEINDEX_EXTENSION},
+    shared::fs::{delete_file, open_append_file, write_encoded_structure},
 };
 use bytes::{BufMut, BytesMut};
 use std::{
@@ -70,10 +71,6 @@ impl TimeIndexEntry {
     }
 }
 
-pub const LOG_EXTENSION: &str = "log";
-pub const INDEX_EXTENSION: &str = "index";
-pub const TIMEINDEX_EXTENSION: &str = "timeindex";
-
 pub struct Segment {
     pub base_offset: i64,
     pub dir: PathBuf,
@@ -81,11 +78,12 @@ pub struct Segment {
     pub index_file: File,
     pub timeindex_file: File,
     pub current_size: u32,
+    pub last_offset: i64,
+    pub last_term: u64,
 }
 
 impl Segment {
     pub async fn new(dir: impl AsRef<Path>, base_offset: i64) -> std::io::Result<Self> {
-
         let log_file = open_append_file(&dir, base_offset, LOG_EXTENSION).await?;
         let index_file = open_append_file(&dir, base_offset, INDEX_EXTENSION).await?;
         let timeindex_file = open_append_file(&dir, base_offset, TIMEINDEX_EXTENSION).await?;
@@ -100,6 +98,8 @@ impl Segment {
             index_file,
             timeindex_file,
             current_size,
+            last_offset: base_offset - 1,
+            last_term: 0,
         })
     }
 
@@ -144,6 +144,9 @@ impl Segment {
         .await?;
 
         self.current_size += buffer.len() as u32;
+
+        self.last_offset = batch.base_offset + batch.last_offset_delta as i64;
+        self.last_term = batch.partition_leader_epoch as u64;
 
         Ok(())
     }
@@ -207,16 +210,68 @@ impl Segment {
         Ok(Some(physical_position))
     }
 
-    pub async fn read(&mut self, offset: i64) -> Result<Option<RecordBatch>, String> {
+    async fn seek_to_offset(&mut self, offset: i64) -> Result<Option<u64>, String> {
         let physical_position = match self.find_physical_position(offset).await? {
-            Some(pos) => pos,
+            Some(pos) => pos as u64,
             None => return Ok(None),
         };
 
         self.log_file
-            .seek(SeekFrom::Start(physical_position as u64))
+            .seek(SeekFrom::Start(physical_position))
             .await
             .map_err(|e| format!("IO error when seeking log file: {}", e))?;
+
+        Ok(Some(physical_position))
+    }
+
+    async fn find_index_byte_offset_by_physical_position(
+        &mut self,
+        target_physical_pos: u64,
+        entries_count: u64,
+        file_len: u64,
+    ) -> Result<u64, String> {
+        let mut index_byte_offset = file_len;
+        let mut low = 0u64;
+        let mut high = if entries_count > 0 {
+            entries_count - 1
+        } else {
+            0
+        };
+
+        while low <= high {
+            let mid = low + ((high - low) >> 1);
+
+            self.index_file
+                .seek(SeekFrom::Start(mid * IndexEntry::SIZE as u64))
+                .await
+                .map_err(|e| e.to_string())?;
+
+            let mut index_buf = [0u8; IndexEntry::SIZE];
+            self.index_file
+                .read_exact(&mut index_buf)
+                .await
+                .map_err(|e| e.to_string())?;
+
+            let entry = IndexEntry::decode(&index_buf);
+
+            if entry.physical_position as u64 >= target_physical_pos {
+                index_byte_offset = mid * IndexEntry::SIZE as u64;
+                if mid == 0 {
+                    break;
+                }
+                high = mid - 1;
+            } else {
+                low = mid + 1;
+            }
+        }
+
+        Ok(index_byte_offset)
+    }
+
+    pub async fn read(&mut self, offset: i64) -> Result<Option<RecordBatch>, String> {
+        if self.seek_to_offset(offset).await?.is_none() {
+            return Ok(None);
+        }
 
         let result = self.read_next_batch().await?;
         Ok(result.map(|(batch, _)| batch))
@@ -227,15 +282,9 @@ impl Segment {
         offset: i64,
         max_bytes: usize,
     ) -> Result<Vec<RecordBatch>, String> {
-        let physical_position = match self.find_physical_position(offset).await? {
-            Some(pos) => pos,
-            None => return Ok(vec![]),
-        };
-
-        self.log_file
-            .seek(SeekFrom::Start(physical_position as u64))
-            .await
-            .map_err(|e| format!("IO error when seeking log file: {}", e))?;
+        if self.seek_to_offset(offset).await?.is_none() {
+            return Ok(vec![]);
+        }
 
         let mut batches = Vec::new();
         let mut bytes_read_total = 0;
@@ -263,6 +312,104 @@ impl Segment {
         }
 
         Ok(batches)
+    }
+
+    pub async fn get_term_at_index(&mut self, offset: i64) -> Result<Option<u64>, String> {
+        if self.seek_to_offset(offset).await?.is_none() {
+            return Ok(None);
+        }
+
+        loop {
+            match self.read_next_batch().await {
+                Ok(Some((batch, _))) => {
+                    if offset >= batch.base_offset
+                        && offset < batch.base_offset + batch.records_count as i64
+                    {
+                        return Ok(Some(batch.partition_leader_epoch as u64));
+                    }
+                    if batch.base_offset > offset {
+                        return Ok(None);
+                    }
+                }
+                Ok(None) => return Ok(None),
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    pub async fn truncate(&mut self, offset: i64) -> Result<(), String> {
+        if offset <= self.base_offset {
+            self.log_file.set_len(0).await.map_err(|e| e.to_string())?;
+            self.index_file
+                .set_len(0)
+                .await
+                .map_err(|e| e.to_string())?;
+            self.timeindex_file
+                .set_len(0)
+                .await
+                .map_err(|e| e.to_string())?;
+            self.current_size = 0;
+            self.last_offset = self.base_offset - 1;
+            self.last_term = 0;
+            return Ok(());
+        }
+
+        let physical_position = match self.seek_to_offset(offset).await? {
+            Some(pos) => pos,
+            None => return Ok(()),
+        };
+
+        let mut truncate_pos = physical_position;
+        let mut new_last_offset = self.base_offset - 1;
+        let mut new_last_term = 0;
+
+        loop {
+            match self.read_next_batch().await {
+                Ok(Some((batch, size))) => {
+                    if batch.base_offset >= offset {
+                        break;
+                    }
+                    truncate_pos += size as u64;
+                    new_last_offset = batch.base_offset + batch.last_offset_delta as i64;
+                    new_last_term = batch.partition_leader_epoch as u64;
+                }
+                _ => break,
+            }
+        }
+
+        self.log_file
+            .set_len(truncate_pos)
+            .await
+            .map_err(|e| e.to_string())?;
+        self.current_size = truncate_pos as u32;
+        self.last_offset = new_last_offset;
+        self.last_term = new_last_term;
+
+        let metadata = self
+            .index_file
+            .metadata()
+            .await
+            .map_err(|e| e.to_string())?;
+        let entries_count = metadata.len() / IndexEntry::SIZE as u64;
+
+        let index_truncate_pos = self
+            .find_index_byte_offset_by_physical_position(
+                truncate_pos,
+                entries_count,
+                metadata.len(),
+            )
+            .await?;
+
+        self.index_file
+            .set_len(index_truncate_pos)
+            .await
+            .map_err(|e| e.to_string())?;
+        self.timeindex_file
+            .set_len(index_truncate_pos)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        Ok(())
     }
 
     async fn read_next_batch(&mut self) -> Result<Option<(RecordBatch, usize)>, String> {

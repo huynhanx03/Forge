@@ -19,8 +19,8 @@ pub struct Record {
     pub headers: Vec<Header>,
 }
 
-impl Record {
-    pub fn decode<B: Buf>(buf: &mut B) -> Result<Self, String> {
+impl Type for Record {
+    fn decode<B: Buf>(buf: &mut B) -> Result<Self, String> {
         let length = Varint::decode(buf)?;
 
         if buf.remaining() < 1 {
@@ -68,7 +68,7 @@ impl Record {
         })
     }
 
-    pub fn encode<B: BufMut>(&self, buf: &mut B) {
+    fn encode<B: BufMut>(&self, buf: &mut B) {
         self.length.encode(buf);
         self.attributes.encode(buf);
         self.timestamp_delta.encode(buf);

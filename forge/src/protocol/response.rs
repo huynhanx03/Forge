@@ -1,5 +1,5 @@
-use bytes::BufMut;
 use crate::protocol::types::Type;
+use bytes::BufMut;
 
 #[derive(Debug)]
 pub struct ResponseHeader {

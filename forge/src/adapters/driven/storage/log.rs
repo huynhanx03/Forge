@@ -1,6 +1,6 @@
-use crate::adapters::driven::storage::segment::LOG_EXTENSION;
-use crate::{adapters::driven::storage::segment::Segment, shared::fs::segment_file_path};
 use crate::core::domain::record_batch::RecordBatch;
+use crate::shared::constants::{INDEX_EXTENSION, LOG_EXTENSION, TIMEINDEX_EXTENSION};
+use crate::{adapters::driven::storage::segment::Segment, shared::fs::segment_file_path};
 use std::path::{Path, PathBuf};
 
 pub struct PartitionLog {
@@ -113,8 +113,8 @@ impl PartitionLog {
         if self.retention_ms > 0 {
             self.enforce_retention_by_time().await?;
         }
-        
-        Ok(())   
+
+        Ok(())
     }
 
     pub async fn enforce_retention_by_bytes(&mut self) -> Result<(), String> {
@@ -165,6 +165,116 @@ impl PartitionLog {
             self.remove_segment(0).await?;
             tracing::info!("Removed old segment due to time limit");
         }
+
+        Ok(())
+    }
+
+    pub fn get_last_log_index(&self) -> i64 {
+        if let Some(active_segment) = self.segments.last() {
+            active_segment.last_offset
+        } else {
+            -1
+        }
+    }
+
+    pub fn get_last_log_term(&self) -> u64 {
+        if let Some(active_segment) = self.segments.last() {
+            active_segment.last_term
+        } else {
+            0
+        }
+    }
+
+    pub async fn get_term_at_index(&mut self, offset: i64) -> Result<Option<u64>, String> {
+        let segment_index = match self.find_segment_index(offset) {
+            Some(index) => index,
+            None => return Ok(None),
+        };
+        let active_segment = &mut self.segments[segment_index];
+        active_segment.get_term_at_index(offset).await
+    }
+
+    pub async fn truncate_from_index(&mut self, offset: i64) -> Result<(), String> {
+        let start_segment_index = match self.find_segment_index(offset) {
+            Some(index) => index,
+            None => return Ok(()),
+        };
+
+        while self.segments.len() > start_segment_index + 1 {
+            let _ = self.remove_segment(start_segment_index + 1).await;
+        }
+
+        let active_segment = &mut self.segments[start_segment_index];
+        active_segment.truncate(offset).await?;
+
+        Ok(())
+    }
+
+    pub fn get_first_log_index(&self) -> i64 {
+        if let Some(first_segment) = self.segments.first() {
+            first_segment.base_offset
+        } else {
+            0
+        }
+    }
+
+    pub async fn truncate_prefix(&mut self, last_included_index: i64) -> Result<(), String> {
+        loop {
+            if self.segments.len() <= 1 {
+                break;
+            }
+
+            if self.segments[1].base_offset <= last_included_index {
+                self.remove_segment(0).await?;
+                tracing::info!("Removed old segment due to snapshot prefix truncation");
+            } else {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn swap_compacted_segments(
+        &mut self,
+        num_closed_segments: usize,
+        compacted_segments: Vec<Segment>,
+    ) -> Result<(), String> {
+        if num_closed_segments > self.segments.len() {
+            return Err("Invalid number of segments to swap".to_string());
+        }
+
+        let old_segments: Vec<Segment> = self.segments.drain(0..num_closed_segments).collect();
+        for old in old_segments {
+            let _ = old.delete().await;
+        }
+
+        let mut new_segments = Vec::with_capacity(compacted_segments.len());
+        let mut temp_dir = PathBuf::new();
+
+        for compacted_segment in compacted_segments {
+            let base_offset = compacted_segment.base_offset;
+            temp_dir = compacted_segment.dir.clone();
+
+            let extensions = [LOG_EXTENSION, INDEX_EXTENSION, TIMEINDEX_EXTENSION];
+            for ext in extensions {
+                let temp_file = segment_file_path(&temp_dir, base_offset, ext);
+                let final_file = segment_file_path(&self.dir, base_offset, ext);
+                tokio::fs::rename(temp_file, final_file)
+                    .await
+                    .map_err(|e| e.to_string())?;
+            }
+
+            let new_seg = Segment::new(&self.dir, base_offset)
+                .await
+                .map_err(|e| e.to_string())?;
+            new_segments.push(new_seg);
+        }
+
+        if temp_dir.exists() {
+            let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+        }
+
+        self.segments.splice(0..0, new_segments);
 
         Ok(())
     }
